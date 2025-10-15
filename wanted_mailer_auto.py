@@ -1,6 +1,6 @@
 import requests, smtplib, json, os, time
-from datetime import datetime
-from email.mime.text import MIMEText
+from datetime import datetime, timezone, timedelta
+from email.mime_text import MIMEText
 
 CONFIG_FILE = "config.json"
 LAST_ID_FILE = "last_id.txt"
@@ -43,7 +43,7 @@ def filter_jobs(jobs, conf):
     for j in jobs:
         loc = j.get("address", {}).get("full_location", "")
         pos = j.get("position", "").lower()
-        yrs = j.get("annual_from", 0)
+        yrs = j.get("annual_from", 0) or 0
         if any(r in loc for r in conf["locations"]) and \
            any(k.lower() in pos for k in conf["jobs"]) and \
            yrs >= conf["years"]:
@@ -54,22 +54,50 @@ def filter_jobs(jobs, conf):
 def get_last_id():
     if not os.path.exists(LAST_ID_FILE):
         return None
-    with open(LAST_ID_FILE, "r") as f:
-        return f.read().strip()
+    with open(LAST_ID_FILE, "r", encoding="utf-8") as f:
+        first = f.readline().strip()
+        return first if first else None
 
-def save_last_id(job_id):
-    with open(LAST_ID_FILE, "w") as f:
-        f.write(str(job_id))
+def save_last_id_and_log(latest_id, sent_jobs):
+    """
+    last_id.txt 포맷:
+    1줄: 최신ID
+    이후: 전송 로그 누적 (가장 최신 로그가 위로 오도록)
+    """
+    prev_logs = ""
+    if os.path.exists(LAST_ID_FILE):
+        with open(LAST_ID_FILE, "r", encoding="utf-8") as f:
+            _ = f.readline()  # 기존 최신ID 한 줄 건너뛰기
+            prev_logs = f.read()
+
+    kst = timezone(timedelta(hours=9))
+    ts = datetime.now(kst).strftime('%Y-%m-%d %H:%M:%S KST')
+
+    # 이번 실행 로그(최신 로그가 위에 오도록 이전 로그 앞에 붙임)
+    block_lines = [f"--- {ts} sent {len(sent_jobs)} job(s) ---\n"]
+    for j in sent_jobs:
+        block_lines.append(
+            f"[{j['id']}] {j['company']['name']} - {j['position']} | "
+            f"{j['address'].get('full_location','')} | "
+            f"https://www.wanted.co.kr/wd/{j['id']}\n"
+        )
+    block_lines.append("\n")
+    new_logs = "".join(block_lines) + (prev_logs or "")
+
+    with open(LAST_ID_FILE, "w", encoding="utf-8") as f:
+        f.write(str(latest_id) + "\n\n" + new_logs)
 
 # ===== 메일 빌드 =====
 def build_email(jobs):
-    html = f"<h2>📢 {datetime.now().strftime('%m월 %d일')} 새 채용공고 ({len(jobs)}건)</h2><hr>"
+    kst = timezone(timedelta(hours=9))
+    dt = datetime.now(kst)
+    html = f"<h2>📢 {dt.strftime('%m월 %d일')} 새 채용공고 ({len(jobs)}건)</h2><hr>"
     for j in jobs:
         html += f"""
         <div style='margin-bottom:15px;'>
             <b>{j['company']['name']}</b> - {j['position']}<br>
             📍 {j['address'].get('full_location','')}<br>
-            💰 리워드: {j['reward'].get('formatted_total', 'N/A')}<br>
+            💰 리워드: {j.get('reward', {}).get('formatted_total', 'N/A')}<br>
             <a href='https://www.wanted.co.kr/wd/{j['id']}' target='_blank'>공고 보기</a>
         </div>
         """
@@ -78,7 +106,8 @@ def build_email(jobs):
 # ===== 메일 전송 =====
 def send_mail(to_email, content):
     msg = MIMEText(content, "html")
-    msg["Subject"] = f"[원티드 알림] {datetime.now().strftime('%m월 %d일')} 새 공고 업데이트"
+    kst = timezone(timedelta(hours=9))
+    msg["Subject"] = f"[원티드 알림] {datetime.now(kst).strftime('%m월 %d일')} 새 공고 업데이트"
     msg["From"] = MY_EMAIL
     msg["To"] = to_email
     with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
@@ -114,6 +143,7 @@ if __name__ == "__main__":
     if new_jobs:
         html = build_email(new_jobs)
         send_mail(conf["email"], html)
-        save_last_id(latest_id)
+        # ✅ 최신 ID 저장 + 이번에 보낸 목록을 last_id.txt에 로그로 남김
+        save_last_id_and_log(latest_id, new_jobs)
     else:
         print("📭 새 공고 없음")
